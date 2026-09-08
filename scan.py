@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-TV: 15m grafikte 12H-8H MA Momentum Strategy
-15m x 24 = 360dk = 6H Heikin Ashi close -> EMA20 -> % momentum 0 kesişimi.
-lookahead_on = kapanmamis 6H mum da var (TV ile ayni).
+TV 15m strategy port.
+15m x 24 = 360dk HTF. Her kapanmış 15m'de (lookahead) 6H HA EMA20 %mom.
+Sinyal: son iki 15m kapanışında mom 0 kesişimi — TV plotshape ile aynı an.
 """
 
 from __future__ import annotations
@@ -19,8 +19,10 @@ import requests
 import config
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "ha-momentum/1.0"})
+SESSION.headers.update({"User-Agent": "ha-momentum/1.1"})
 TR = timezone(timedelta(hours=3))
+SIX_H = 6 * 60 * 60 * 1000
+FIFTEEN = 15 * 60 * 1000
 
 
 def now_tr() -> str:
@@ -50,45 +52,46 @@ def get_tickers() -> list[dict]:
     return rows[: config.MAX_SYMBOLS]
 
 
-def candles_6h(symbol: str, limit: int = 80) -> pd.DataFrame | None:
+def fetch_candles(symbol: str, gran: str, limit: int) -> pd.DataFrame | None:
     try:
         r = SESSION.get(
             f"{config.BITGET_BASE}/api/v2/mix/market/candles",
             params={
                 "symbol": symbol,
-                "granularity": "6H",
+                "granularity": gran,
                 "limit": str(limit),
                 "productType": config.PRODUCT_TYPE,
             },
             timeout=15,
         )
-        body = r.json()
-        raw = body.get("data") or []
-        if len(raw) < 30:
+        raw = (r.json().get("data") or [])
+        if len(raw) < 20:
             return None
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "base_vol", "quote_vol"])
-        for col in ["ts", "open", "high", "low", "close", "base_vol", "quote_vol"]:
+        for col in ["ts", "open", "high", "low", "close"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna().sort_values("ts").reset_index(drop=True)
-        return df if len(df) >= 30 else None
+        return df.dropna().sort_values("ts").reset_index(drop=True)
     except requests.RequestException:
         return None
 
 
-def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    o = df["open"].to_numpy(dtype=float)
-    h = df["high"].to_numpy(dtype=float)
-    l = df["low"].to_numpy(dtype=float)
-    c = df["close"].to_numpy(dtype=float)
+def drop_unclosed_15m(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    last = int(df["ts"].iloc[-1])
+    now_ms = int(time.time() * 1000)
+    if now_ms < last + FIFTEEN - 3000:
+        return df.iloc[:-1].reset_index(drop=True)
+    return df
+
+
+def heikin_ashi_close(o, h, l, c) -> np.ndarray:
     ha_c = (o + h + l + c) / 4.0
     ha_o = np.empty_like(ha_c)
     ha_o[0] = (o[0] + c[0]) / 2.0
     for i in range(1, len(c)):
         ha_o[i] = (ha_o[i - 1] + ha_c[i - 1]) / 2.0
-    out = df.copy()
-    out["ha_close"] = ha_c
-    out["ha_open"] = ha_o
-    return out
+    return ha_c
 
 
 def ema(arr: np.ndarray, n: int) -> np.ndarray:
@@ -100,22 +103,63 @@ def ema(arr: np.ndarray, n: int) -> np.ndarray:
     return out
 
 
-def signal_from_6h(df: pd.DataFrame) -> dict | None:
-    ha = heikin_ashi(df)
-    ma = ema(ha["ha_close"].to_numpy(dtype=float), config.MA_LEN)
-    if len(ma) < config.MA_LEN + 3:
+def momentum_of(df6: pd.DataFrame) -> float | None:
+    if df6 is None or len(df6) < config.MA_LEN + 2:
         return None
-    # lookback 1, percent, smooth 1
-    prev = ma[:-1]
-    mom = np.zeros_like(ma)
-    mom[1:] = np.where(prev != 0, (ma[1:] - prev) / prev * 100.0, 0.0)
-    m0, m1 = float(mom[-2]), float(mom[-1])
+    o = df6["open"].to_numpy(dtype=float)
+    h = df6["high"].to_numpy(dtype=float)
+    l = df6["low"].to_numpy(dtype=float)
+    c = df6["close"].to_numpy(dtype=float)
+    ha_c = heikin_ashi_close(o, h, l, c)
+    ma = ema(ha_c, config.MA_LEN)
+    if ma[-2] == 0:
+        return None
+    return float((ma[-1] - ma[-2]) / ma[-2] * 100.0)
+
+
+def merge_forming(df6: pd.DataFrame, df15: pd.DataFrame, drop_last_15: bool) -> pd.DataFrame:
+    out = df6.copy()
+    if df15 is None or df15.empty:
+        return out
+    work = df15.iloc[:-1] if drop_last_15 and len(df15) else df15
+    if work.empty:
+        return out
+    start = int(out["ts"].iloc[-1])
+    end = start + SIX_H
+    piece = work[(work["ts"] >= start) & (work["ts"] < end)]
+    if piece.empty:
+        return out
+    out.loc[out.index[-1], "high"] = max(float(out["high"].iloc[-1]), float(piece["high"].max()))
+    out.loc[out.index[-1], "low"] = min(float(out["low"].iloc[-1]), float(piece["low"].min()))
+    out.loc[out.index[-1], "close"] = float(piece["close"].iloc[-1])
+    return out
+
+
+def eval_symbol(symbol: str) -> dict | None:
+    d6 = fetch_candles(symbol, "6H", 80)
+    d15 = fetch_candles(symbol, "15m", 40)
+    time.sleep(0.05)
+    if d6 is None or d15 is None:
+        return None
+    d15 = drop_unclosed_15m(d15)
+    if d15 is None or len(d15) < 3:
+        return None
+    now_df = merge_forming(d6, d15, drop_last_15=False)
+    prev_df = merge_forming(d6, d15, drop_last_15=True)
+    m1 = momentum_of(now_df)
+    m0 = momentum_of(prev_df)
+    if m0 is None or m1 is None:
+        return None
+    side = None
+    if m0 <= 0 < m1:
+        side = "LONG"
+    elif m0 >= 0 > m1:
+        side = "SHORT"
     return {
-        "momentum": round(m1, 4),
-        "momentum_prev_bar": round(m0, 4),
-        "ma": float(ma[-1]),
-        "ha_close": float(ha["ha_close"].iloc[-1]),
-        "bar_close": float(df["close"].iloc[-1]),
+        "side": side,
+        "m0": round(m0, 4),
+        "m1": round(m1, 4),
+        "close": float(d15["close"].iloc[-1]),
     }
 
 
@@ -169,62 +213,45 @@ def send_tg(text: str) -> bool:
         return False
 
 
-def fmt(sym: str, side: str, price: float, info: dict) -> str:
+def fmt(sym: str, side: str, info: dict) -> str:
     arrow = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
     return (
-        f"{arrow}  <b>{sym}</b>  [HA-MOM 15m→6H]\n"
+        f"{arrow}  <b>{sym}</b>  [HA-MOM 15m]\n"
         f"{now_tr()}\n"
-        f"Fiyat: <b>{price}</b>\n"
-        f"6H HA EMA20 mom: {info.get('prev_scan', info.get('momentum_prev_bar'))} → {info['momentum']}\n"
-        f"TV kontrol: 15m grafik + aynı strategy. Momentum 0 kesişimi.\n"
-        f"<i>lookahead açık (kapanmamış 6H). Tavsiye değildir.</i>"
+        f"Fiyat: <b>{info['close']}</b>\n"
+        f"15m mom: {info['m0']} → {info['m1']}\n"
+        f"TV: 15m + aynı strategy, son kapanmış 15m ok.\n"
+        f"<i>Tavsiye değildir.</i>"
     )
 
 
 def main() -> None:
     tickers = get_tickers()
-    print(f"{len(tickers)} kripto taranacak")
+    print(f"{len(tickers)} kripto")
     state = load_state()
     sent = 0
-    for i, row in enumerate(tickers):
+    for row in tickers:
         sym = row.get("symbol")
-        df = candles_6h(sym)
-        time.sleep(0.04)
-        if df is None:
+        try:
+            info = eval_symbol(sym)
+        except Exception as exc:
+            print("err", sym, exc)
             continue
-        info = signal_from_6h(df)
-        if not info:
+        if not info or not info["side"]:
             continue
-        m1 = float(info["momentum"])
-        prev_scan = (state.get("mom") or {}).get(sym)
-        state.setdefault("mom", {})[sym] = m1
-        if prev_scan is None:
-            print("ilk", sym, m1)
-            continue
-        side = None
-        if prev_scan <= 0 < m1:
-            side = "LONG"
-        elif prev_scan >= 0 > m1:
-            side = "SHORT"
-        if not side:
-            continue
-        info["prev_scan"] = prev_scan
+        side = info["side"]
         key = f"{sym}:{side}"
         if not cooldown_ok(state, key):
             print("cd", key)
             continue
-        try:
-            price = float(row.get("lastPr") or info["bar_close"])
-        except (TypeError, ValueError):
-            price = info["bar_close"]
-        if send_tg(fmt(sym, side, price, info)):
+        if send_tg(fmt(sym, side, info)):
             state.setdefault("last", {})[key] = datetime.now(timezone.utc).isoformat()
             sent += 1
-            print("ok", key, price, prev_scan, m1)
-        if sent >= 8:
+            print("ok", key, info)
+        if sent >= 6:
             break
     save_state(state)
-    print("bitti telegram", sent)
+    print("bitti", sent)
 
 
 if __name__ == "__main__":
