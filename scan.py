@@ -110,15 +110,9 @@ def signal_from_6h(df: pd.DataFrame) -> dict | None:
     mom = np.zeros_like(ma)
     mom[1:] = np.where(prev != 0, (ma[1:] - prev) / prev * 100.0, 0.0)
     m0, m1 = float(mom[-2]), float(mom[-1])
-    side = None
-    if m0 <= 0 < m1:
-        side = "LONG"
-    elif m0 >= 0 > m1:
-        side = "SHORT"
     return {
-        "side": side,
         "momentum": round(m1, 4),
-        "momentum_prev": round(m0, 4),
+        "momentum_prev_bar": round(m0, 4),
         "ma": float(ma[-1]),
         "ha_close": float(ha["ha_close"].iloc[-1]),
         "bar_close": float(df["close"].iloc[-1]),
@@ -181,7 +175,7 @@ def fmt(sym: str, side: str, price: float, info: dict) -> str:
         f"{arrow}  <b>{sym}</b>  [HA-MOM 15m→6H]\n"
         f"{now_tr()}\n"
         f"Fiyat: <b>{price}</b>\n"
-        f"6H HA EMA20 mom: {info['momentum_prev']} → {info['momentum']}\n"
+        f"6H HA EMA20 mom: {info.get('prev_scan', info.get('momentum_prev_bar'))} → {info['momentum']}\n"
         f"TV kontrol: 15m grafik + aynı strategy. Momentum 0 kesişimi.\n"
         f"<i>lookahead açık (kapanmamış 6H). Tavsiye değildir.</i>"
     )
@@ -199,9 +193,22 @@ def main() -> None:
         if df is None:
             continue
         info = signal_from_6h(df)
-        if not info or not info["side"]:
+        if not info:
             continue
-        side = info["side"]
+        m1 = float(info["momentum"])
+        prev_scan = (state.get("mom") or {}).get(sym)
+        state.setdefault("mom", {})[sym] = m1
+        if prev_scan is None:
+            print("ilk", sym, m1)
+            continue
+        side = None
+        if prev_scan <= 0 < m1:
+            side = "LONG"
+        elif prev_scan >= 0 > m1:
+            side = "SHORT"
+        if not side:
+            continue
+        info["prev_scan"] = prev_scan
         key = f"{sym}:{side}"
         if not cooldown_ok(state, key):
             print("cd", key)
@@ -213,7 +220,7 @@ def main() -> None:
         if send_tg(fmt(sym, side, price, info)):
             state.setdefault("last", {})[key] = datetime.now(timezone.utc).isoformat()
             sent += 1
-            print("ok", key, price, info["momentum"])
+            print("ok", key, price, prev_scan, m1)
         if sent >= 8:
             break
     save_state(state)
